@@ -4,14 +4,15 @@ Blink + Tap AAC — merged detectors with crosstalk fixes
 
 What it does
 - BLINK: MAD-z on RMS of (Fp1−Fp2) band 0.5–8 Hz → Next
-- TAP: EMG pulse on forearm (10–50 Hz). New **one-shot FSM** (min/max width) so holds don’t spam taps → Select
+- TAP: EMG pulse on forearm (10–50 Hz). One-shot FSM (min/max width) so holds don’t spam taps → Select
 - FIST (hold): EMG RMS ≥ threshold for ≥ duration → Speak (suppresses taps while active)
 - EYEBROW raise: Fp1 & Fp2 RMS (20–150 Hz) ≥ thresholds → Favorites
 
 Key fixes
 - **Tap vs Fist:** tap is detected only when the envelope crosses the threshold and returns below within a width window. While fist is active, tap FSM is suppressed & reset.
 - **Brow vs Blink:** brow activity sets a **blink veto window** so eyebrow raises don’t generate multiple blinks.
-- **NEW (Fist pre/during/post veto for Tap):** During fist wind-up, accumulation, and just after firing, taps are vetoed and tap state is reset to prevent stray pulses.
+- **Fist pre/during/post veto for Tap:** During fist wind-up, accumulation, and just after firing, taps are vetoed and tap state is reset to prevent stray pulses.
+- **NEW: Duration-based double gestures:** A long blink (≥ blink_long_ms) or long tap (≥ tap_long_ms) is treated as a double, in addition to the existing “two quick pulses” logic.
 
 Mock keys inside the Tk window: b=blink, t=tap, h=fist, e=brow, q=quit.
 """
@@ -55,24 +56,28 @@ DEFAULTS = dict(
     double_max_gap_ms = 350,
     # Optional post-event quiet time (after we finalize single or double)
     post_event_refractory_ms = 300,
-    # Blink / Tap (from your original working build)
+
+    # Blink / Tap
     blink_band=(0.5, 8.0),
-    tap_band=(10.0, 50.0),
+    tap_band=(15.0, 55.0),
     blink_window_sec=0.25,
-    tap_window_sec=0.15,
-    tap_k=40.0,                 # shorter window helps pulse width measurement
-    blink_k=0.0,                # MAD-z threshold
-    tap_uv_thresh=15.0,         # µV threshold for tap pulses (raise from 10 to avoid noise)
-    blink_refractory_sec=0.8,   # longer to avoid brow-induced repeats
-    tap_refractory_sec=0.55,    # slightly longer between taps
+    tap_window_sec=0.12,
+    tap_k=0.0,                  # MAD-z threshold (z >= blink_k is "above")
+    tap_uv_thresh=14.0,         # µV threshold for tap pulses
+    blink_refractory_sec=0.8,
+    tap_refractory_sec=0.55,
     veto_after_tap_ms=100,
     notch_hz=50.0,
+
+    # NEW: duration-based double thresholds
+    blink_long_ms = 220,        # blink held above threshold for this long → double
+    tap_long_ms   = 120,        # tap held above threshold for this long → double
 
     # Tap pulse width gates (milliseconds)
     tap_min_on_ms=50,
     tap_max_on_ms=300,
 
-    # Fist hold (unchanged)
+    # Fist hold
     fist_min_uv=70.0,
     fist_hold_min_ms=400,
     fist_refractory_ms=900,
@@ -80,7 +85,7 @@ DEFAULTS = dict(
     # Eyebrow raise
     brow_band=(20.0, 150.0),
     brow_window_sec=0.20,
-    brow_fp1_uv=85.0,             # bump a bit to avoid blink bleed
+    brow_fp1_uv=85.0,
     brow_fp2_uv=100.0,
     brow_min_ms=160,
     brow_refractory_ms=700,
@@ -95,7 +100,7 @@ DEFAULTS = dict(
     brow_pre_fp2_uv = 85.0,
     brow_pre_veto_ms = 300,
 
-    # NEW: short post-hold tap veto to block rebound taps immediately after a fist fires
+    # Post-hold tap veto (rebound after fist fires)
     fist_post_veto_ms = 220,
 )
 
@@ -146,7 +151,7 @@ class SignalWorker(threading.Thread):
     Tap:   one-shot pulse (threshold crossing with min/max width).
     Fist:  sustained RMS ≥ fist_min for ≥ fist_hold_min_ms (suppresses taps).
     Brow:  Fp1 & Fp2 RMS 20–150 Hz ≥ thresholds for ≥ brow_min_ms (vetoes blinks).
-    Emits: 'blink', 'tap', 'tap_hold', 'brow'.
+    Emits: 'blink', 'blink_double', 'tap', 'tap_double', 'tap_hold', 'brow'.
     """
     def __init__(self, args, event_q: queue.Queue):
         super().__init__(daemon=True)
@@ -155,11 +160,22 @@ class SignalWorker(threading.Thread):
         self.board=None; self.board_id=None
         self.sr=250; self.eeg_channels=[]
         self.blink_ch_pair=None; self.tap_ch=None
+        self._tap_calib_done = False
+        self._tap_bg_mad = deque(maxlen=600)  # ~3 s at 200 Hz window steps
+
+        # Pending for double windows
         self.blink_pending_ms = None
         self.tap_pending_ms   = None
 
-        # Simple rising-edge latch for blink z-crossing
+        # Blink edge/duration tracking
         self._blink_above = False
+        self._blink_above_start_ms = None
+        self._blink_long_sent = False
+
+        # Tap edge/duration tracking
+        self._tap_above = False
+        self._tap_above_start_ms = None
+        self._tap_long_sent = False
 
         # Buffers
         self.buf_len=None
@@ -168,19 +184,19 @@ class SignalWorker(threading.Thread):
 
         # Timers/veto
         self.veto_blink_until_ms=-10**9
-        self.veto_tap_until_ms  =-10**9   # NEW: tap veto window
+        self.veto_tap_until_ms  =-10**9
         self.last_blink_ts=0.0; self.last_tap_ts=0.0
 
         # Detectors state
         self.fist_det = RangeHoldDetector(args.fist_min_uv, args.fist_hold_min_ms, None, args.fist_refractory_ms)
         self.brow_db = Debounce(args.brow_refractory_ms); self.brow_on_ms=None
 
-        # Tap FSM
+        # Tap FSM (legacy fields kept)
         self.tap_on_ms=None; self.tap_peak_uv=0.0
 
     def stop(self): self.stop_flag.set()
 
-    # --- small helpers (NEW) --- #
+    # --- small helpers --- #
     def _veto_tap_until(self, until_ms: int):
         self.veto_tap_until_ms = max(self.veto_tap_until_ms, until_ms)
 
@@ -260,40 +276,56 @@ class SignalWorker(threading.Thread):
                 butter_bandpass_inplace(xb,self.sr,self.args.blink_band[0],self.args.blink_band[1])
                 blink_rms=float(np.sqrt(np.mean((xb[-win_blink:])**2)))
                 blink_z,_,_=robust_mad_zpush(self.blink_hist, blink_rms)
-                # ----- Blink: rising-edge detect + double window -----
-                blink_edge = (blink_z >= self.args.blink_k)
-                # Track rising/falling to create discrete edges
+
+                blink_edge = (blink_z >= self.args.blink_k)  # "above" = candidate blink
+
+                # --- Blink rising/falling & long-hold double ---
                 if blink_edge and not self._blink_above and t_ms >= self.veto_blink_until_ms:
-                    # Got a blink edge
+                    self._blink_above = True
+                    self._blink_above_start_ms = t_ms
+                    self._blink_long_sent = False
+
+                if self._blink_above and blink_edge and not self._blink_long_sent and t_ms >= self.veto_blink_until_ms:
+                    if (t_ms - self._blink_above_start_ms) >= self.args.blink_long_ms:
+                        # Long blink → DOUBLE
+                        self.q.put(("blink_double", now))
+                        self._blink_long_sent = True
+                        self.blink_pending_ms = None
+                        self.last_blink_ts = now
+                        self.veto_blink_until_ms = max(self.veto_blink_until_ms, t_ms + self.args.post_event_refractory_ms)
+
+                # Legacy double-by-gap logic (only if no long double fired this bout)
+                if blink_edge and not self._blink_long_sent and t_ms >= self.veto_blink_until_ms:
                     if self.blink_pending_ms is None:
-                        # start waiting for a second blink
                         self.blink_pending_ms = t_ms
                     else:
                         gap = t_ms - self.blink_pending_ms
                         if self.args.double_min_gap_ms <= gap <= self.args.double_max_gap_ms:
-                            # DOUBLE blink → Back
                             self.q.put(("blink_double", now))
                             self.blink_pending_ms = None
-                            # post-quiet after finalizing
                             self.last_blink_ts = now
-                            self.veto_blink_until_ms = max(self.veto_blink_until_ms,
-                                                           t_ms + self.args.post_event_refractory_ms)
-                        else:
-                            # too far: finalize the old one as single and start new window
+                            self.veto_blink_until_ms = max(self.veto_blink_until_ms, t_ms + self.args.post_event_refractory_ms)
+                        elif gap > self.args.double_max_gap_ms:
+                            # Window expired → finalize as single and start new
                             self.q.put(("blink", now))
                             self.last_blink_ts = now
-                            self.veto_blink_until_ms = max(self.veto_blink_until_ms,
-                                                           t_ms + self.args.post_event_refractory_ms)
+                            self.veto_blink_until_ms = max(self.veto_blink_until_ms, t_ms + self.args.post_event_refractory_ms)
                             self.blink_pending_ms = t_ms
-                # finalize single if window expired
-                if self.blink_pending_ms is not None and (t_ms - self.blink_pending_ms) > self.args.double_max_gap_ms:
+
+                # finalize single if window expired (no long double)
+                if (self.blink_pending_ms is not None and
+                        (t_ms - self.blink_pending_ms) > self.args.double_max_gap_ms and
+                        not self._blink_long_sent and t_ms >= self.veto_blink_until_ms):
                     self.q.put(("blink", now))
                     self.last_blink_ts = now
-                    self.veto_blink_until_ms = max(self.veto_blink_until_ms,
-                                                   t_ms + self.args.post_event_refractory_ms)
+                    self.veto_blink_until_ms = max(self.veto_blink_until_ms, t_ms + self.args.post_event_refractory_ms)
                     self.blink_pending_ms = None
 
-                self._blink_above = blink_edge
+                # Falling edge: reset above state
+                if self._blink_above and not blink_edge:
+                    self._blink_above = False
+                    self._blink_above_start_ms = None
+                    self._blink_long_sent = False
 
                 # ----- Tap/Fist: EMG 10–50 Hz -----
                 xt=np.asarray(self.buf_tap, dtype=np.float64).copy()
@@ -302,76 +334,95 @@ class SignalWorker(threading.Thread):
                 if self.args.notch_hz>0: butter_bandstop_inplace(xt,self.sr,self.args.notch_hz)
                 butter_bandpass_inplace(xt,self.sr,self.args.tap_band[0],self.args.tap_band[1])
                 xw=xt[-win_tap:]
-                tap_env_uv=float(np.sqrt(np.mean(xw**2)))   # for fist & stability
-                tap_amp_uv=float(np.max(np.abs(xw)))
-                trigger_uv = max(tap_amp_uv, tap_env_uv)
+                tap_env_uv = float(np.sqrt(np.mean(xw ** 2)))  # RMS envelope (hold/fist)
+                tap_p95_uv = float(np.percentile(np.abs(xw), 95))  # robust peak for taps
+                tap_amp_uv = max(tap_p95_uv, tap_env_uv)  # what FSM uses
+                tap_edge = (tap_amp_uv >= self.args.tap_uv_thresh)
+                # "above" for tap = amplitude threshold
+                # --- PRE-VETO FOR FIST WIND-UP ---
 
-                # --- PRE-VETO FOR FIST WIND-UP (NEW stronger behavior) ---
+                if (not self._tap_calib_done) and (t_ms >= self.veto_tap_until_ms) and (not self.fist_det.on_ms):
+                    self._tap_bg_mad.append(tap_p95_uv)
+                    if len(self._tap_bg_mad) == self._tap_bg_mad.maxlen:
+                        arr = np.asarray(self._tap_bg_mad, dtype=np.float64)
+                        med = np.median(arr);
+                        mad = np.median(np.abs(arr - med)) + 1e-9
+                        # Set threshold ≈ median + 6×MAD, clamp to 12–20 µV
+                        self.args.tap_uv_thresh = float(np.clip(med + 6 * mad, 12.0, 20.0))
+                        self._tap_calib_done = True
+                        print(f"[AUTO] tap_uv_thresh -> {self.args.tap_uv_thresh:.1f} µV")
+
                 if tap_env_uv >= self.args.fist_pre_uv:
-                    # Veto taps during wind-up, and also reset any half-started tap windows
                     self._veto_tap_until(t_ms + self.args.fist_pre_veto_ms)
                     self._clear_tap_pending()
-                    # Keep your blink veto here if desired
                     self.veto_blink_until_ms = max(self.veto_blink_until_ms, t_ms + self.args.fist_pre_veto_ms)
 
                 # FIST detection first; if active, suppress taps
                 fist_fired = self.fist_det.update(tap_env_uv, t_ms)
-                fist_active = (self.fist_det.on_ms is not None)  # True while accumulating
+                fist_active = (self.fist_det.on_ms is not None)
 
                 if fist_active:
-                    # While accumulating the hold, keep taps vetoed (prevents stray pulses mid-hold)
-                    self._veto_tap_until(t_ms + 50)  # small sliding window
+                    self._veto_tap_until(t_ms + 50)  # keep sliding veto during accumulation
                     self._clear_tap_pending()
 
                 if fist_fired:
-                    # when the hold actually fires: speak + veto taps briefly after release (rebound)
                     self._veto_tap_until(t_ms + self.args.fist_post_veto_ms)
                     self._clear_tap_pending()
                     self.veto_blink_until_ms = max(self.veto_blink_until_ms, t_ms + self.args.veto_after_tap_ms)
                     self.q.put(("tap_hold", now))
 
+                # --- Tap rising/falling & long-hold double (only when taps allowed) ---
+                if not fist_active and (t_ms >= self.veto_tap_until_ms):
+                    if tap_edge and not self._tap_above:
+                        self._tap_above = True
+                        self._tap_above_start_ms = t_ms
+                        self._tap_long_sent = False
+                    if self._tap_above and tap_edge and not self._tap_long_sent:
+                        if (t_ms - self._tap_above_start_ms) >= self.args.tap_long_ms:
+                            # Long tap → DOUBLE
+                            self.q.put(("tap_double", now))
+                            self._tap_long_sent = True
+                            self.tap_pending_ms = None
+                            self.last_tap_ts = now
+                            # blink veto after taps (same as single)
+                            self.veto_blink_until_ms = max(self.veto_blink_until_ms, t_ms + self.args.veto_after_tap_ms)
+                            self.veto_blink_until_ms = max(self.veto_blink_until_ms, t_ms + self.args.post_event_refractory_ms)
+                    if self._tap_above and not tap_edge:
+                        self._tap_above = False
+                        self._tap_above_start_ms = None
+                        self._tap_long_sent = False
+
                 # ----- TAP FSM (one-shot). Suppress if fist is active. -----
-                if not fist_active:  # still suppress taps while a fist-hold is on
-                    # --- EARLY GUARD: TAP VETO WINDOW (NEW) ---
+                if not fist_active:
+                    # Early guard: tap veto window
                     if t_ms < self.veto_tap_until_ms:
-                        # While vetoed, keep state clean so a half-pulse can’t later be finalized
                         self._clear_tap_pending()
-                    else:
+                    elif not self._tap_long_sent:  # skip FSM if long-double already fired this bout
                         min_width_s = 0.08
                         above = np.mean(np.abs(xw) > self.args.tap_uv_thresh) * (win_tap / self.sr)
 
                         if ((now - self.last_tap_ts) > self.args.tap_refractory_sec
                                 and tap_amp_uv >= self.args.tap_uv_thresh
                                 and above >= min_width_s):
-                            # We detected a TAP pulse (one-shot)
                             if self.tap_pending_ms is None:
-                                # start double window
                                 self.tap_pending_ms = t_ms
                             else:
                                 gap = t_ms - self.tap_pending_ms
                                 if self.args.double_min_gap_ms <= gap <= self.args.double_max_gap_ms:
-                                    # DOUBLE TAP → Home
                                     self.q.put(("tap_double", now))
                                     self.tap_pending_ms = None
-                                    # usual blink veto after taps
-                                    self.veto_blink_until_ms = max(self.veto_blink_until_ms,
-                                                                   t_ms + self.args.veto_after_tap_ms)
-                                    # short post refractory to avoid bounce
-                                    self.veto_blink_until_ms = max(self.veto_blink_until_ms,
-                                                                   t_ms + self.args.post_event_refractory_ms)
-                                else:
-                                    # old pending too old → finalize it as single, start new
+                                    self.veto_blink_until_ms = max(self.veto_blink_until_ms, t_ms + self.args.veto_after_tap_ms)
+                                    self.veto_blink_until_ms = max(self.veto_blink_until_ms, t_ms + self.args.post_event_refractory_ms)
+                                elif gap > self.args.double_max_gap_ms:
                                     self.q.put(("tap", now))
-                                    self.veto_blink_until_ms = max(self.veto_blink_until_ms,
-                                                                   t_ms + self.args.veto_after_tap_ms)
+                                    self.veto_blink_until_ms = max(self.veto_blink_until_ms, t_ms + self.args.veto_after_tap_ms)
                                     self.tap_pending_ms = t_ms
 
-                        # finalize single TAP if the window expires (only when fist not active)
+                        # finalize pending single if window expires
                         if self.tap_pending_ms is not None and \
                                 (t_ms - self.tap_pending_ms) > self.args.double_max_gap_ms:
                             self.q.put(("tap", now))
-                            self.veto_blink_until_ms = max(self.veto_blink_until_ms,
-                                                           t_ms + self.args.veto_after_tap_ms)
+                            self.veto_blink_until_ms = max(self.veto_blink_until_ms, t_ms + self.args.veto_after_tap_ms)
                             self.tap_pending_ms = None
 
                 # ----- Brow: Fp1 & Fp2 20–150 Hz → RMS -----
@@ -395,7 +446,6 @@ class SignalWorker(threading.Thread):
                         self.brow_on_ms=t_ms
                     elif (t_ms - self.brow_on_ms) >= self.args.brow_min_ms and self.brow_db.ready(t_ms):
                         self.brow_db.stamp(t_ms); self.brow_on_ms=None
-                        # Veto subsequent blinks briefly
                         self.veto_blink_until_ms = max(self.veto_blink_until_ms, t_ms + self.args.brow_veto_ms)
                         self.q.put(("brow", now))
                 else:
@@ -473,7 +523,7 @@ class AACApp:
         self.root.title("Blink + Tap AAC"); self.root.geometry("700x540"); self.root.configure(padx=16,pady=16)
         self.status = ttk.Label(
             self.root,
-            text="Categories: Blink=Next • Tap=Open   |   Phrases: Blink=Next • Fist=Speak (Tap disabled)",
+            text="Categories — Blink: Next • (dbl) Back • Tap: Open • (dbl) Home   |   Phrases — Blink: Next • Fist: Speak",
             font=("Segoe UI", 11)
         )
         self.status.pack(anchor='w', pady=(0, 6))
@@ -502,8 +552,8 @@ class AACApp:
             self.item_idx = 0
             self._refresh_ui()
         else:
-            # in categories, move to previous item for convenience
             self.prev_item()
+
     def _refresh_ui(self):
         for item in self.tree.get_children():
             self.tree.delete(item)
@@ -512,7 +562,6 @@ class AACApp:
                 tag = 'active' if i == self.cat_idx else ''
                 self.tree.insert('', 'end', text=("→ " if tag else "   ") + cat, tags=(tag,))
             self.status.config(text="Categories — Blink: Next • (dbl) Back • Tap: Open • (dbl) Home")
-
         else:
             current = self.categories[self.cat_idx]
             items = self.phrases[self.cat_idx]
@@ -571,32 +620,18 @@ class AACApp:
         if kind in self.counts:
             self.counts[kind] += 1
 
-        # Always allowed
         if kind == "blink":
             self.next_item()
-
-        # Tap: ONLY in Categories (level 0)
         elif kind == "tap":
             if self.level == 0:
                 self.select_item()
-            else:
-                return  # ignore tap in phrases
-
-        # Fist: ONLY in Phrases (level 1)
         elif kind == "tap_hold":
             if self.level == 1:
                 self.speak_selected()
-            else:
-                return  # ignore fist in categories
-
-        # Brow stays global (opens Favorites)
         elif kind == "brow":
             self.open_favorites()
-
         elif kind == "quit":
-            self.shutdown();
-            self.root.destroy()
-
+            self.shutdown(); self.root.destroy()
         elif kind == "blink_double":
             self.back()
         elif kind == "tap_double":
@@ -608,7 +643,7 @@ class AACApp:
 
 # ---------------- CLI / main ---------------- #
 def parse_args():
-    p=argparse.ArgumentParser(description="Blink + Tap AAC (crosstalk-hardened)")
+    p=argparse.ArgumentParser(description="Blink + Tap AAC (crosstalk-hardened + duration doubles)")
     p.add_argument('--mock', action='store_true', help='Run without hardware; use b/t/h/e/q keys')
 
     # BrainFlow / Cyton
@@ -621,12 +656,12 @@ def parse_args():
     p.add_argument('--blink-ch', type=int, nargs=2, default=[0,1], help='Fp1,Fp2 channels (bipolar for blink; per-ch for brow)')
     p.add_argument('--tap-ch', type=int, default=None, help='Forearm EMG bipolar P−N (SRB2 OFF).')
 
-    # Blink/tap (original)
+    # Blink/tap bands and windows
     p.add_argument('--blink-band', type=float, nargs=2, default=list(DEFAULTS['blink_band']))
     p.add_argument('--tap-band', type=float, nargs=2, default=list(DEFAULTS['tap_band']))
     p.add_argument('--blink-window-sec', type=float, default=DEFAULTS['blink_window_sec'])
     p.add_argument('--tap-window-sec', type=float, default=DEFAULTS['tap_window_sec'])
-    p.add_argument('--blink-k', type=float, default=DEFAULTS['blink_k'])
+    p.add_argument('--blink-k', type=float, default=DEFAULTS['tap_k'])  # (kept same naming from your defaults)
     p.add_argument('--tap-uv-thresh', type=float, default=DEFAULTS['tap_uv_thresh'])
     p.add_argument('--tap-min-on-ms', type=int, default=DEFAULTS['tap_min_on_ms'])
     p.add_argument('--tap-max-on-ms', type=int, default=DEFAULTS['tap_max_on_ms'])
@@ -634,6 +669,12 @@ def parse_args():
     p.add_argument('--tap-refractory-sec', type=float, default=DEFAULTS['tap_refractory_sec'])
     p.add_argument('--veto-after-tap-ms', type=int, default=DEFAULTS['veto_after_tap_ms'])
     p.add_argument('--notch-hz', type=float, default=DEFAULTS['notch_hz'])
+
+    # Double windows and long-hold durations
+    p.add_argument('--double-min-gap-ms', type=int, default=DEFAULTS['double_min_gap_ms'])
+    p.add_argument('--double-max-gap-ms', type=int, default=DEFAULTS['double_max_gap_ms'])
+    p.add_argument('--blink-long-ms', type=int, default=DEFAULTS['blink_long_ms'])
+    p.add_argument('--tap-long-ms', type=int, default=DEFAULTS['tap_long_ms'])
 
     # Fist & Brow
     p.add_argument('--fist-min-uv', type=float, default=DEFAULTS['fist_min_uv'])
@@ -652,18 +693,17 @@ def parse_args():
     p.add_argument('--brow-pre-fp1-uv', type=float, default=DEFAULTS['brow_pre_fp1_uv'])
     p.add_argument('--brow-pre-fp2-uv', type=float, default=DEFAULTS['brow_pre_fp2_uv'])
     p.add_argument('--brow-pre-veto-ms', type=int, default=DEFAULTS['brow_pre_veto_ms'])
-
-    # NEW: post-hold veto duration for taps
     p.add_argument('--fist-post-veto-ms', type=int, default=DEFAULTS['fist_post_veto_ms'])
 
     return p.parse_args()
 
 def main():
     args=parse_args()
-    # ensure defaults for any missing keys (safety if edited)
+    # ensure defaults for any missing keys
     for k,v in DEFAULTS.items():
-        if not hasattr(args, k.replace('-', '_')):
-            setattr(args, k, v)
+        attr = k.replace('-', '_')
+        if not hasattr(args, attr):
+            setattr(args, attr, v)
     if not BRAINFLOW_AVAILABLE and not args.mock:
         print("[WARN] BrainFlow not available; starting in MOCK mode."); args.mock=True
     evq=queue.Queue(); worker=SignalWorker(args, evq); worker.start()
