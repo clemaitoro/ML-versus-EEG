@@ -1,0 +1,2 @@
+file,ts_col_1b,mk_col_1b,segments,sr_est,per_class_json
+BrainFlow-RAW_Data_0.csv,23,24,6,91180.52173913043,"{""blink"": 1, ""tap"": 1, ""blink_double"": 1, ""tap_double"": 1, ""brow"": 1, ""fist_hold"": 1}"

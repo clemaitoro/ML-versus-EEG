@@ -2,14 +2,13 @@
 # Live AAC inference (CUDA) — LSL (GUI) or BrainFlow source
 # Requirements: torch, numpy, scipy, pandas, pylsl (for LSL mode), brainflow (optional for direct mode)
 
-import argparse, time, json, sys, math, threading, queue, numpy as np
+import argparse, time, json, threading, queue, numpy as np
 from collections import deque
 from scipy.signal import butter, filtfilt, detrend, iirnotch
-
 import torch
 import torch.nn as nn
 
-# ---------- Model definition (must match training) ----------
+# ---------- Model (must match training) ----------
 class Small1DCNN(nn.Module):
     def __init__(self, in_ch=4, n_classes=6):
         super().__init__()
@@ -54,16 +53,16 @@ def apply_chain(x, sr, band, notch_hz=50.0):
     x = filtfilt(b, a, x)
     return x.astype(np.float32)
 
-# ---------- Source threads ----------
+# ---------- Sources ----------
 class LSLReader(threading.Thread):
-    """Reads from OpenBCI GUI LSL EEG stream. Expects 8-ch float32 at args.sr."""
+    """Reads from OpenBCI GUI LSL EEG stream. Pushes [Ch, Hop] chunks."""
     def __init__(self, args, out_q):
         super().__init__(daemon=True); self.args=args; self.q=out_q; self.stop_flag=threading.Event()
     def stop(self): self.stop_flag.set()
     def run(self):
         try:
             from pylsl import StreamInlet, resolve_byprop
-        except Exception as e:
+        except Exception:
             print("[ERR] pylsl not installed. pip install pylsl"); return
         print("[INFO] Resolving LSL EEG stream...")
         streams = resolve_byprop('type', 'EEG', timeout=10)
@@ -71,33 +70,28 @@ class LSLReader(threading.Thread):
             print("[ERR] No LSL EEG stream found. Start OpenBCI GUI → Networking → LSL."); return
         inlet = StreamInlet(streams[0], max_buflen=60, processing_flags=1)
         sr = self.args.sr
-        chunk_hop = max(1, int(sr * self.args.hop_s))
+        hop = max(1, int(sr * self.args.hop_s))
         buf = []
-        t_last = time.time()
         while not self.stop_flag.is_set():
             samples, _ = inlet.pull_chunk(timeout=0.05)
-            if not samples:
-                continue
-            buf.extend(samples)
-            # push in hops ~hop_s
-            now = time.time()
-            if len(buf) >= chunk_hop:
-                arr = np.asarray(buf[:chunk_hop], dtype=np.float32)  # [H, Ch]
-                del buf[:chunk_hop]
-                self.q.put(arr.T)  # -> [Ch, H]
+            if not samples: continue
+            buf.extend(samples)  # list of [Ch] rows
+            while len(buf) >= hop:
+                arr = np.asarray(buf[:hop], dtype=np.float32)  # [Hop, Ch]
+                del buf[:hop]
+                self.q.put(arr.T)  # -> [Ch, Hop]
 
 class BrainFlowReader(threading.Thread):
-    """Direct from Cyton via BrainFlow."""
+    """Direct from Cyton via BrainFlow. Pushes [Ch, Hop] chunks."""
     def __init__(self, args, out_q):
         super().__init__(daemon=True); self.args=args; self.q=out_q; self.stop_flag=threading.Event()
     def stop(self): self.stop_flag.set()
     def run(self):
         try:
             from brainflow.board_shim import BoardShim, BrainFlowInputParams, BoardIds
-        except Exception as e:
+        except Exception:
             print("[ERR] brainflow not installed. pip install brainflow"); return
-        params = BrainFlowInputParams()
-        params.serial_port = self.args.port or "COM3"
+        params = BrainFlowInputParams(); params.serial_port = self.args.port or "COM3"
         board_id = BoardIds.CYTON_BOARD
         board = BoardShim(board_id, params)
         BoardShim.enable_dev_board_logger()
@@ -105,161 +99,157 @@ class BrainFlowReader(threading.Thread):
         sr = BoardShim.get_sampling_rate(board_id)
         hop = max(1, int(sr * self.args.hop_s))
         print(f"[INFO] BrainFlow stream started @ {sr} Hz")
-        while not self.stop_flag.is_set():
-            data = board.get_board_data()
-            if data.size==0:
-                time.sleep(0.01); continue
-            # data shape: [channels, samples]
-            # Send out hop-sized chunks
-            num = data.shape[1]
-            for i in range(0, num, hop):
-                sl = data[:, i:i+hop]
-                if sl.shape[1] == 0: continue
-                self.q.put(sl.astype(np.float32))
         try:
-            board.stop_stream(); board.release_session()
-        except Exception: pass
+            while not self.stop_flag.is_set():
+                data = board.get_board_data()  # [Ch, N]
+                if data.size == 0:
+                    time.sleep(0.01); continue
+                N = data.shape[1]
+                for i in range(0, N, hop):
+                    sl = data[:, i:i+hop]
+                    if sl.shape[1] == 0: continue
+                    self.q.put(sl.astype(np.float32))
+        finally:
+            try: board.stop_stream(); board.release_session()
+            except Exception: pass
 
 # ---------- Live decoder ----------
 class LiveDecoder:
-    def __init__(self, model_path, stats_json, device, sr,
-                 eeg_band=(0.5,40.0), emg_band=(15.0,55.0), notch_hz=50.0,
-                 win_pre=0.20, win_post=0.80, hop_s=0.05,
-                 fp1_idx=0, fp2_idx=1, emg_idx=2,
-                 class_order=("blink","blink_double","tap","tap_double","fist_hold","brow"),
-                 min_conf=0.6, refractory_ms=350, ema=0.6):
-        self.device=device; self.sr=sr
-        self.eeg_band=eeg_band; self.emg_band=emg_band; self.notch=notch_hz
-        self.N = int(round((win_pre+win_post)*sr))
-        self.hop = max(1, int(round(hop_s*sr)))
-        self.fp1_i, self.fp2_i, self.emg_i = fp1_idx, fp2_idx, emg_idx
-        self.classes=list(class_order)
-        self.min_conf=min_conf
-        self.refractory_ms=refractory_ms
-        self.last_fire_ms = -10**9
-        self.ema=ema
-        self.post_prob=None
+    def __init__(self, model_path, stats_json, device,
+                 sr, eeg_band, emg_band, notch_hz,
+                 win_pre, win_post, hop_s,
+                 fp1_idx, fp2_idx, emg_idx,
+                 class_order, min_conf, refractory_ms, ema):
 
-        # ring buffers
+        self.device = device
+        # Load model (+ possible meta)
+        ckpt = torch.load(model_path, map_location=device)
+        n_classes = len(class_order) if class_order is not None else ckpt.get("meta", {}).get("class_order", None)
+        if isinstance(n_classes, list): n_classes = len(n_classes)
+        self.model = Small1DCNN(in_ch=4, n_classes=(n_classes or 6)).to(device).eval()
+        self.model.load_state_dict(ckpt["model_state"])
+
+        # Load stats (preferred) or fall back to ckpt meta
+        meta = ckpt.get("meta", {})
+        if stats_json:
+            with open(stats_json, "r") as f: st = json.load(f)
+        else:
+            st = meta
+
+        # Use training settings if present
+        self.classes = st.get("class_order", class_order or ["blink","blink_double","tap","tap_double","fist_hold","brow"])
+        self.sr      = int(st.get("sr", sr))
+        bands        = st.get("bands", {})
+        self.eeg_band = tuple(bands.get("eeg", eeg_band))
+        self.emg_band = tuple(bands.get("emg", emg_band))
+        self.notch    = float(st.get("notch_hz", notch_hz))
+        win           = st.get("window", {"pre_s": win_pre, "post_s": win_post})
+        self.win_pre  = float(win.get("pre_s", win_pre))
+        self.win_post = float(win.get("post_s", win_post))
+
+        # Buffers from window
+        self.N   = int(round((self.win_pre + self.win_post) * self.sr))
+        self.hop = max(1, int(round(hop_s * self.sr)))
+
+        # Channel mapping (1-based from CLI → 0-based)
+        self.fp1_i = fp1_idx
+        self.fp2_i = fp2_idx
+        self.emg_i = emg_idx  # None disables EMG
+
+        # Thresholding
+        self.min_conf = float(min_conf)
+        self.refractory_ms = int(refractory_ms)
+        self.last_fire_ms = -10**9
+        self.ema = float(ema)
+        self.post_prob = None
+
+        # Ring buffers
         self.buf_fp1 = deque(maxlen=self.N)
         self.buf_fp2 = deque(maxlen=self.N)
         self.buf_emg = deque(maxlen=self.N)
 
-        # Load model + stats
-        ckpt = torch.load(model_path, map_location=device)
-        self.model = Small1DCNN(in_ch=4, n_classes=len(self.classes)).to(device).eval()
-        self.model.load_state_dict(ckpt["model_state"])
-
-        with open(stats_json, "r") as f:
-            st = json.load(f)
-        mean = np.array(st["mean"], dtype=np.float32)[:,None]  # (C,1)
-        std  = np.array(st["std"],  dtype=np.float32)[:,None]  # (C,1)
+        # Normalization stats
+        mean = np.array(st["mean"], dtype=np.float32)[:, None]  # (C,1)
+        std  = np.array(st["std"],  dtype=np.float32)[:, None]
         self.mean = torch.from_numpy(mean).to(device)
         self.std  = torch.from_numpy(std).to(device)
 
-    def _push_chunk(self, chunk):  # chunk: [Ch, H]
-        # Some streams may include >8 channels; we only use three
+    def _push_chunk(self, chunk):  # [Ch, Hop]
         ch = chunk.shape[0]
+        emg_on = (self.emg_i is not None) and (self.emg_i < ch)
         for i in range(chunk.shape[1]):
             s = chunk[:, i]
-            # Guard against missing emg index
-            emg = s[self.emg_i] if (self.emg_i is not None and self.emg_i < ch) else 0.0
             self.buf_fp1.append(float(s[self.fp1_i]))
             self.buf_fp2.append(float(s[self.fp2_i]))
-            self.buf_emg.append(float(emg))
+            self.buf_emg.append(float(s[self.emg_i]) if emg_on else 0.0)
 
     def _current_window(self):
         if len(self.buf_fp1) < self.N: return None
         fp1 = np.asarray(self.buf_fp1, dtype=np.float32)
         fp2 = np.asarray(self.buf_fp2, dtype=np.float32)
         emg = np.asarray(self.buf_emg, dtype=np.float32)
-
         fp1f = apply_chain(fp1, self.sr, self.eeg_band, self.notch)
         fp2f = apply_chain(fp2, self.sr, self.eeg_band, self.notch)
         bip  = (fp1f - fp2f).astype(np.float32)
         emgf = apply_chain(emg, self.sr, self.emg_band, self.notch) if (self.emg_i is not None) else np.zeros_like(bip)
-
-        x = np.stack([fp1f, fp2f, bip, emgf], axis=0)  # (C,T)
-        return x
+        return np.stack([fp1f, fp2f, bip, emgf], axis=0)  # (C,T)
 
     @torch.no_grad()
     def step(self, chunk):
         self._push_chunk(chunk)
         if len(self.buf_fp1) < self.N:
             return None
-
         x = self._current_window()
         t = torch.from_numpy(x).to(self.device).unsqueeze(0)  # [1,C,T]
-        # per-channel normalization
         t = (t - self.mean) / (self.std + 1e-6)
         logits = self.model(t.float())
-        probs = torch.softmax(logits, dim=1).detach().cpu().numpy()[0]  # (K,)
+        probs = torch.softmax(logits, dim=1).detach().cpu().numpy()[0]
         # EMA smoothing
-        if self.post_prob is None:
-            self.post_prob = probs.copy()
-        else:
-            self.post_prob = self.ema*probs + (1-self.ema)*self.post_prob
-        k = int(np.argmax(self.post_prob))
-        p = float(self.post_prob[k])
+        self.post_prob = probs if self.post_prob is None else (self.ema*probs + (1-self.ema)*self.post_prob)
+        k = int(np.argmax(self.post_prob)); p = float(self.post_prob[k])
 
-        # refractory eventing
         now_ms = int(time.time()*1000)
-        fired = False
-        if p >= self.min_conf and (now_ms - self.last_fire_ms) >= self.refractory_ms:
-            fired = True
-            self.last_fire_ms = now_ms
-        return {"top": self.classes[k], "p": p, "probs": self.post_prob.copy(), "fired": fired}
+        fired = (p >= self.min_conf) and ((now_ms - self.last_fire_ms) >= self.refractory_ms)
+        if fired: self.last_fire_ms = now_ms
+        return {"top": self.classes[k], "p": p, "fired": fired}
 
-# ---------- Pretty console ----------
-def bar(p, width=20):
-    n = int(round(p*width))
-    return "█"*n + "░"*(width-n)
-
+# ---------- Runner ----------
 def run(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[INFO] device: {device}")
 
+    # Build class order from --stats if present; otherwise CLI string
+    cli_order = args.class_order.split(",") if args.class_order else None
+
     dec = LiveDecoder(
-        model_path=args.model, stats_json=args.stats, device=device, sr=args.sr,
-        eeg_band=tuple(args.eeg_band), emg_band=tuple(args.emg_band), notch_hz=args.notch,
+        model_path=args.model, stats_json=args.stats, device=device,
+        sr=args.sr, eeg_band=tuple(args.eeg_band), emg_band=tuple(args.emg_band), notch_hz=args.notch,
         win_pre=args.pre_s, win_post=args.post_s, hop_s=args.hop_s,
         fp1_idx=args.fp1-1, fp2_idx=args.fp2-1, emg_idx=(args.emg-1 if args.emg>0 else None),
-        class_order=args.class_order.split(","),
+        class_order=cli_order,
         min_conf=args.min_conf, refractory_ms=args.refractory_ms, ema=args.ema
     )
 
     qin = queue.Queue(maxsize=32)
-    if args.source == "lsl":
-        src = LSLReader(args, qin)
-    else:
-        src = BrainFlowReader(args, qin)
+    src = LSLReader(args, qin) if args.source == "lsl" else BrainFlowReader(args, qin)
     src.start()
 
-    print("\n== Live decode running ==")
-    print("Controls: Ctrl+C to quit")
-    last_print = 0
+    print("\n== Live decode running ==\n(Ctrl+C to quit)")
     try:
         while True:
             try:
-                chunk = qin.get(timeout=0.2)  # [Ch, H]
+                chunk = qin.get(timeout=0.2)  # [Ch, Hop]
             except queue.Empty:
                 continue
-
             out = dec.step(chunk)
-            if not out:
-                continue
-
-            if out["fired"]:
-                # Print only the chosen word, nothing else
+            if out and out["fired"]:
+                # Print only the chosen word
                 print(out["top"], flush=True)
     except KeyboardInterrupt:
         pass
     finally:
-        try:
-            src.stop()
-        except Exception:
-            pass
-
+        try: src.stop()
+        except Exception: pass
 
 # ---------- CLI ----------
 if __name__ == "__main__":
@@ -268,7 +258,7 @@ if __name__ == "__main__":
     ap.add_argument("--model", default="aac_cnn.pt")
     ap.add_argument("--stats", default="aac_norm_stats.json")
 
-    # Sampling / preprocessing (must match training)
+    # Sampling / preprocessing (used only if stats/meta missing)
     ap.add_argument("--sr", type=int, default=250)
     ap.add_argument("--notch", type=float, default=50.0)
     ap.add_argument("--eeg-band", type=float, nargs=2, default=[0.5, 40.0])
@@ -277,7 +267,7 @@ if __name__ == "__main__":
     ap.add_argument("--post-s", type=float, default=0.80)
     ap.add_argument("--hop-s", type=float, default=0.05)
 
-    # Channel indices (GUI shows 1..8; pass 0 to disable EMG)
+    # Channel indices from GUI (1..8). Pass 0 to disable EMG.
     ap.add_argument("--fp1", type=int, default=1)
     ap.add_argument("--fp2", type=int, default=2)
     ap.add_argument("--emg", type=int, default=3)
