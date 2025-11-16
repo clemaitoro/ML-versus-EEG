@@ -2,6 +2,67 @@ import socket
 import struct
 import time
 import random
+import sys
+
+# ---------- LANGUAGE SWITCH (CLI) ---------- #
+LANG = "en"
+if "--ro" in sys.argv:
+    LANG = "ro"
+elif "--en" in sys.argv:
+    LANG = "en"
+
+print(f"[INFO] TTS language set to: {LANG}")
+
+# Canonical keys for TTS lines: labels + meta prompts
+TTS_TEXT = {
+    "READY": {
+        "en": "Ready",
+        "ro": "Pregătit",
+    },
+    "STOP": {
+        "en": "Stop",
+        "ro": "Stop",
+    },
+    "REST": {
+        "en": "Rest",
+        "ro": "Relaxează-te",
+    },
+    "BLINK": {
+        "en": "Blink",
+        "ro": "Clipește",
+    },
+    "DOUBLE BLINK": {
+        "en": "Double blink",
+        "ro": "Clipește de două ori",
+    },
+    "FIST": {
+        "en": "Fist clench",
+        "ro": "Strânge pumnul",
+    },
+    "TAP": {
+        "en": "Tap",
+        "ro": "Atinge",
+    },
+    "DOUBLE TAP": {
+        "en": "Double tap",
+        "ro": "Atinge de două ori",
+    },
+    "BROW": {
+        "en": "Eyebrow raise",
+        "ro": "Ridică sprâncenele",
+    },
+}
+
+def tr(key: str) -> str:
+    """
+    Translate a canonical TTS key or label to the selected language.
+    Falls back to the key itself if not found.
+    """
+    entry = TTS_TEXT.get(key)
+    if not entry:
+        return key
+    return entry.get(LANG, key)
+
 
 # ---------- TTS via SAPI (same logic style as your AAC script) ---------- #
 try:
@@ -149,7 +210,7 @@ def init_tts():
 
     try:
         tts = SapiTTS(voice_name=None, rate=170, volume=1.0)
-        tts.say("Ready", purge=True)
+        tts.say(tr("READY"), purge=True)
         print("[INFO] SAPI TTS initialized.")
         return tts
     except Exception as e:
@@ -157,8 +218,13 @@ def init_tts():
         return None
 
 
-def speak(tts, text: str):
-    print(f"[VOICE] {text}")
+def speak(tts, text_key: str):
+    """
+    text_key is one of the canonical keys or labels:
+      READY, STOP, REST, BLINK, DOUBLE BLINK, FIST, TAP, DOUBLE TAP, BROW
+    """
+    text = tr(text_key)
+    print(f"[VOICE-{LANG}] {text}")
     if tts is None:
         return
     try:
@@ -197,11 +263,8 @@ def main():
         send_marker(sock, start_val)
         print(f"  Sent marker {start_val} ({start_key})")
 
-        # Slightly nicer voice cue for brow
-        if label == "BROW":
-            speak(tts, "Eyebrow raise")
-        else:
-            speak(tts, label)
+        # Voice cue in selected language
+        speak(tts, label)
 
         print(f"  {label} for {duration} seconds...")
         try:
@@ -213,7 +276,7 @@ def main():
         stop_val = MARKERS[stop_key]
         send_marker(sock, stop_val)
         print(f"  Sent marker {stop_val} ({stop_key})")
-        speak(tts, "Stop")
+        speak(tts, "STOP")
 
         if i < len(trials):
             print(f"  Inter-trial pause {INTER_TRIAL_PAUSE} s...")
