@@ -21,7 +21,7 @@ from pathlib import Path
 
 # ------------ CONFIG ------------ #
 
-DATA_ROOT = r"E:\School\Thesis\Andrei"   # TODO: set this
+DATA_ROOT = r"E:\PythonProject\Licenta\new train_way\data_raw"   # TODO: set this
 
 OUT_EEG = "dataset_eeg_blinks_brow.npz"
 OUT_EMG = "dataset_emg_taps_fist.npz"
